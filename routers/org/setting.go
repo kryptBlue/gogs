@@ -5,13 +5,17 @@
 package org
 
 import (
+	"strings"
+
 	"github.com/Unknwon/com"
+
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/auth"
 	"github.com/gogits/gogs/modules/base"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
 	"github.com/gogits/gogs/modules/setting"
+	"github.com/gogits/gogs/routers/user"
 )
 
 const (
@@ -20,13 +24,13 @@ const (
 	SETTINGS_HOOKS   base.TplName = "org/settings/hooks"
 )
 
-func Settings(ctx *middleware.Context) {
+func Settings(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsOptions"] = true
 	ctx.HTML(200, SETTINGS_OPTIONS)
 }
 
-func SettingsPost(ctx *middleware.Context, form auth.UpdateOrgSettingForm) {
+func SettingsPost(ctx *context.Context, form auth.UpdateOrgSettingForm) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsOptions"] = true
 
@@ -38,60 +42,87 @@ func SettingsPost(ctx *middleware.Context, form auth.UpdateOrgSettingForm) {
 	org := ctx.Org.Organization
 
 	// Check if organization name has been changed.
-	if org.Name != form.OrgUserName {
-		isExist, err := models.IsUserExist(org.Id, form.OrgUserName)
+	if org.LowerName != strings.ToLower(form.Name) {
+		isExist, err := models.IsUserExist(org.Id, form.Name)
 		if err != nil {
 			ctx.Handle(500, "IsUserExist", err)
 			return
 		} else if isExist {
-			ctx.Data["Err_UserName"] = true
+			ctx.Data["OrgName"] = true
 			ctx.RenderWithErr(ctx.Tr("form.username_been_taken"), SETTINGS_OPTIONS, &form)
 			return
-		} else if err = models.ChangeUserName(org, form.OrgUserName); err != nil {
+		} else if err = models.ChangeUserName(org, form.Name); err != nil {
 			if err == models.ErrUserNameIllegal {
-				ctx.Data["Err_UserName"] = true
+				ctx.Data["OrgName"] = true
 				ctx.RenderWithErr(ctx.Tr("form.illegal_username"), SETTINGS_OPTIONS, &form)
 			} else {
 				ctx.Handle(500, "ChangeUserName", err)
 			}
 			return
 		}
-		log.Trace("Organization name changed: %s -> %s", org.Name, form.OrgUserName)
-		org.Name = form.OrgUserName
+		// reset ctx.org.OrgLink with new name
+		ctx.Org.OrgLink = setting.AppSubUrl + "/org/" + form.Name
+		log.Trace("Organization name changed: %s -> %s", org.Name, form.Name)
+	}
+	// In case it's just a case change.
+	org.Name = form.Name
+	org.LowerName = strings.ToLower(form.Name)
+
+	if ctx.User.IsAdmin {
+		org.MaxRepoCreation = form.MaxRepoCreation
 	}
 
-	org.FullName = form.OrgFullName
-	org.Email = form.Email
+	org.FullName = form.FullName
 	org.Description = form.Description
 	org.Website = form.Website
 	org.Location = form.Location
-	org.Avatar = base.EncodeMd5(form.Avatar)
-	org.AvatarEmail = form.Avatar
 	if err := models.UpdateUser(org); err != nil {
-		if models.IsErrEmailAlreadyUsed(err) {
-			ctx.Data["Err_Email"] = true
-			ctx.RenderWithErr(ctx.Tr("form.email_been_used"), SETTINGS_OPTIONS, &form)
-		} else {
-			ctx.Handle(500, "UpdateUser", err)
-		}
+		ctx.Handle(500, "UpdateUser", err)
 		return
 	}
 	log.Trace("Organization setting updated: %s", org.Name)
 	ctx.Flash.Success(ctx.Tr("org.settings.update_setting_success"))
-	ctx.Redirect(setting.AppSubUrl + "/org/" + org.Name + "/settings")
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
 }
 
-func SettingsDelete(ctx *middleware.Context) {
+func SettingsAvatar(ctx *context.Context, form auth.UploadAvatarForm) {
+	form.Enable = true
+	if err := user.UpdateAvatarSetting(ctx, form, ctx.Org.Organization); err != nil {
+		ctx.Flash.Error(err.Error())
+	} else {
+		ctx.Flash.Success(ctx.Tr("org.settings.update_avatar_success"))
+	}
+
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+func SettingsDeleteAvatar(ctx *context.Context) {
+	if err := ctx.Org.Organization.DeleteAvatar(); err != nil {
+		ctx.Flash.Error(err.Error())
+	}
+
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+func SettingsDelete(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsDelete"] = true
 
 	org := ctx.Org.Organization
 	if ctx.Req.Method == "POST" {
-		// FIXME: validate password.
+		if _, err := models.UserSignIn(ctx.User.Name, ctx.Query("password")); err != nil {
+			if models.IsErrUserNotExist(err) {
+				ctx.RenderWithErr(ctx.Tr("form.enterred_invalid_password"), SETTINGS_DELETE, nil)
+			} else {
+				ctx.Handle(500, "UserSignIn", err)
+			}
+			return
+		}
+
 		if err := models.DeleteOrganization(org); err != nil {
 			if models.IsErrUserOwnRepos(err) {
 				ctx.Flash.Error(ctx.Tr("form.org_still_own_repo"))
-				ctx.Redirect(setting.AppSubUrl + "/org/" + org.LowerName + "/settings/delete")
+				ctx.Redirect(ctx.Org.OrgLink + "/settings/delete")
 			} else {
 				ctx.Handle(500, "DeleteOrganization", err)
 			}
@@ -105,9 +136,11 @@ func SettingsDelete(ctx *middleware.Context) {
 	ctx.HTML(200, SETTINGS_DELETE)
 }
 
-func SettingsHooks(ctx *middleware.Context) {
+func Webhooks(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsHooks"] = true
+	ctx.Data["BaseLink"] = ctx.Org.OrgLink
+	ctx.Data["Description"] = ctx.Tr("org.settings.hooks_desc")
 
 	// Delete web hook.
 	remove := com.StrTo(ctx.Query("remove")).MustInt64()
@@ -129,4 +162,16 @@ func SettingsHooks(ctx *middleware.Context) {
 
 	ctx.Data["Webhooks"] = ws
 	ctx.HTML(200, SETTINGS_HOOKS)
+}
+
+func DeleteWebhook(ctx *context.Context) {
+	if err := models.DeleteWebhook(ctx.QueryInt64("id")); err != nil {
+		ctx.Flash.Error("DeleteWebhook: " + err.Error())
+	} else {
+		ctx.Flash.Success(ctx.Tr("repo.settings.webhook_deletion_success"))
+	}
+
+	ctx.JSON(200, map[string]interface{}{
+		"redirect": ctx.Org.OrgLink + "/settings/hooks",
+	})
 }

@@ -16,13 +16,15 @@ import (
 	"time"
 
 	"github.com/Unknwon/com"
-	"github.com/macaron-contrib/oauth2"
-	"github.com/macaron-contrib/session"
+	_ "github.com/go-macaron/cache/memcache"
+	_ "github.com/go-macaron/cache/redis"
+	"github.com/go-macaron/session"
+	_ "github.com/go-macaron/session/redis"
 	"gopkg.in/ini.v1"
 
 	"github.com/gogits/gogs/modules/bindata"
 	"github.com/gogits/gogs/modules/log"
-	// "github.com/gogits/gogs/modules/ssh"
+	"github.com/gogits/gogs/modules/user"
 )
 
 type Scheme string
@@ -41,19 +43,24 @@ const (
 )
 
 var (
-	// App settings.
-	AppVer    string
-	AppName   string
-	AppUrl    string
-	AppSubUrl string
+	// Build information
+	BuildTime    string
+	BuildGitHash string
 
-	// Server settings.
+	// App settings
+	AppVer         string
+	AppName        string
+	AppUrl         string
+	AppSubUrl      string
+	AppSubUrlDepth int // Number of slashes
+	AppPath        string
+	AppDataPath    string
+
+	// Server settings
 	Protocol           Scheme
 	Domain             string
 	HttpAddr, HttpPort string
-	DisableSSH         bool
-	SSHPort            int
-	SSHDomain          string
+	LocalURL           string
 	OfflineMode        bool
 	DisableRouterLog   bool
 	CertFile, KeyFile  string
@@ -61,7 +68,20 @@ var (
 	EnableGzip         bool
 	LandingPageUrl     LandingPage
 
-	// Security settings.
+	SSH struct {
+		Disabled            bool           `ini:"DISABLE_SSH"`
+		StartBuiltinServer  bool           `ini:"START_SSH_SERVER"`
+		Domain              string         `ini:"SSH_DOMAIN"`
+		Port                int            `ini:"SSH_PORT"`
+		ListenPort          int            `ini:"SSH_LISTEN_PORT"`
+		RootPath            string         `ini:"SSH_ROOT_PATH"`
+		KeyTestPath         string         `ini:"SSH_KEY_TEST_PATH"`
+		KeygenPath          string         `ini:"SSH_KEYGEN_PATH"`
+		MinimumKeySizeCheck bool           `ini:"-"`
+		MinimumKeySizes     map[string]int `ini:"-"`
+	}
+
+	// Security settings
 	InstallLock          bool
 	SecretKey            string
 	LogInRememberDays    int
@@ -69,77 +89,123 @@ var (
 	CookieRememberName   string
 	ReverseProxyAuthUser string
 
-	// Database settings.
+	// Database settings
 	UseSQLite3    bool
 	UseMySQL      bool
 	UsePostgreSQL bool
+	UseTiDB       bool
 
-	// Webhook settings.
+	// Webhook settings
 	Webhook struct {
 		QueueLength    int
 		DeliverTimeout int
 		SkipTLSVerify  bool
+		Types          []string
+		PagingNum      int
 	}
 
-	// Repository settings.
+	// Repository settings
+	Repository struct {
+		AnsiCharset            string
+		ForcePrivate           bool
+		MaxCreationLimit       int
+		PullRequestQueueLength int
+	}
 	RepoRootPath string
 	ScriptType   string
 
-	// UI settings.
-	IssuePagingNum int
+	// UI settings
+	ExplorePagingNum     int
+	IssuePagingNum       int
+	FeedMaxCommitNum     int
+	AdminUserPagingNum   int
+	AdminRepoPagingNum   int
+	AdminNoticePagingNum int
+	AdminOrgPagingNum    int
+	ThemeColorMetaTag    string
 
-	// Picture settings.
-	PictureService   string
+	// Markdown sttings
+	Markdown struct {
+		EnableHardLineBreak bool
+		CustomURLSchemes    []string `ini:"CUSTOM_URL_SCHEMES"`
+	}
+
+	// Picture settings
 	AvatarUploadPath string
 	GravatarSource   string
 	DisableGravatar  bool
 
-	// Log settings.
+	// Log settings
 	LogRootPath string
 	LogModes    []string
 	LogConfigs  []string
 
-	// Attachment settings.
+	// Attachment settings
 	AttachmentPath         string
 	AttachmentAllowedTypes string
 	AttachmentMaxSize      int64
 	AttachmentMaxFiles     int
 	AttachmentEnabled      bool
 
-	// Time settings.
+	// Time settings
 	TimeFormat string
 
-	// Cache settings.
+	// Cache settings
 	CacheAdapter  string
 	CacheInternal int
 	CacheConn     string
 
-	EnableRedis    bool
-	EnableMemcache bool
+	// Session settings
+	SessionConfig  session.Options
+	CSRFCookieName = "_csrf"
 
-	// Session settings.
-	SessionConfig session.Options
-
-	// Git settings.
+	// Git settings
 	Git struct {
 		MaxGitDiffLines int
 		GcArgs          []string `delim:" "`
-		Fsck            struct {
-			Enable   bool
-			Interval int
-			Args     []string `delim:" "`
-		} `ini:"git.fsck"`
+		Timeout         struct {
+			Migrate int
+			Mirror  int
+			Clone   int
+			Pull    int
+		} `ini:"git.timeout"`
 	}
 
-	// I18n settings.
+	// Cron tasks
+	Cron struct {
+		UpdateMirror struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+		} `ini:"cron.update_mirrors"`
+		RepoHealthCheck struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+			Timeout    time.Duration
+			Args       []string `delim:" "`
+		} `ini:"cron.repo_health_check"`
+		CheckRepoStats struct {
+			Enabled    bool
+			RunAtStart bool
+			Schedule   string
+		} `ini:"cron.check_repo_stats"`
+	}
+
+	// I18n settings
 	Langs, Names []string
+	dateLangs    map[string]string
 
-	// Other settings.
-	ShowFooterBranding bool
+	// Highlight settings are loaded in modules/template/hightlight.go
 
-	// Global setting objects.
+	// Other settings
+	ShowFooterBranding    bool
+	ShowFooterVersion     bool
+	SupportMiniWinService bool
+
+	// Global setting objects
 	Cfg          *ini.File
-	CustomPath   string // Custom directory path.
+	CustomPath   string // Custom directory path
 	CustomConf   string
 	ProdMode     bool
 	RunUser      string
@@ -147,27 +213,49 @@ var (
 	HasRobotsTxt bool
 )
 
-func init() {
-	IsWindows = runtime.GOOS == "windows"
-	log.NewLogger(0, "console", `{"level": 0}`)
+func DateLang(lang string) string {
+	name, ok := dateLangs[lang]
+	if ok {
+		return name
+	}
+	return "en"
 }
 
-func ExecPath() (string, error) {
+// execPath returns the executable path.
+func execPath() (string, error) {
 	file, err := exec.LookPath(os.Args[0])
 	if err != nil {
 		return "", err
 	}
-	p, err := filepath.Abs(file)
-	if err != nil {
-		return "", err
+	return filepath.Abs(file)
+}
+
+func init() {
+	IsWindows = runtime.GOOS == "windows"
+	log.NewLogger(0, "console", `{"level": 0}`)
+
+	var err error
+	if AppPath, err = execPath(); err != nil {
+		log.Fatal(4, "fail to get app path: %v\n", err)
 	}
-	return p, nil
+
+	// Note: we don't use path.Dir here because it does not handle case
+	//	which path starts with two "/" in Windows: "//psf/Home/..."
+	AppPath = strings.Replace(AppPath, "\\", "/", -1)
 }
 
 // WorkDir returns absolute path of work directory.
 func WorkDir() (string, error) {
-	execPath, err := ExecPath()
-	return path.Dir(strings.Replace(execPath, "\\", "/", -1)), err
+	wd := os.Getenv("GOGS_WORK_DIR")
+	if len(wd) > 0 {
+		return wd, nil
+	}
+
+	i := strings.LastIndex(AppPath, "/")
+	if i == -1 {
+		return AppPath, nil
+	}
+	return AppPath[:i], nil
 }
 
 func forcePathSeparator(path string) {
@@ -176,9 +264,9 @@ func forcePathSeparator(path string) {
 	}
 }
 
-// NewConfigContext initializes configuration context.
+// NewContext initializes configuration context.
 // NOTE: do not print any log except error.
-func NewConfigContext() {
+func NewContext() {
 	workDir, err := WorkDir()
 	if err != nil {
 		log.Fatal(4, "Fail to get work directory: %v", err)
@@ -191,11 +279,11 @@ func NewConfigContext() {
 
 	CustomPath = os.Getenv("GOGS_CUSTOM")
 	if len(CustomPath) == 0 {
-		CustomPath = path.Join(workDir, "custom")
+		CustomPath = workDir + "/custom"
 	}
 
 	if len(CustomConf) == 0 {
-		CustomConf = path.Join(CustomPath, "conf/app.ini")
+		CustomConf = CustomPath + "/conf/app.ini"
 	}
 
 	if com.IsFile(CustomConf) {
@@ -203,9 +291,15 @@ func NewConfigContext() {
 			log.Fatal(4, "Fail to load custom conf '%s': %v", CustomConf, err)
 		}
 	} else {
-		log.Warn("Custom config (%s) not found, ignore this if you're running first time", CustomConf)
+		log.Warn("Custom config '%s' not found, ignore this if you're running first time", CustomConf)
 	}
 	Cfg.NameMapper = ini.AllCapsUnderscore
+
+	homeDir, err := com.HomeDir()
+	if err != nil {
+		log.Fatal(4, "Fail to get home directory: %v", err)
+	}
+	homeDir = strings.Replace(homeDir, "\\", "/", -1)
 
 	LogRootPath = Cfg.Section("log").Key("ROOT_PATH").MustString(path.Join(workDir, "log"))
 	forcePathSeparator(LogRootPath)
@@ -220,9 +314,11 @@ func NewConfigContext() {
 	// Check if has app suburl.
 	url, err := url.Parse(AppUrl)
 	if err != nil {
-		log.Fatal(4, "Invalid ROOT_URL(%s): %s", AppUrl, err)
+		log.Fatal(4, "Invalid ROOT_URL '%s': %s", AppUrl, err)
 	}
+	// Suburl should start with '/' and end without '/', such as '/{subpath}'.
 	AppSubUrl = strings.TrimSuffix(url.Path, "/")
+	AppSubUrlDepth = strings.Count(AppSubUrl, "/")
 
 	Protocol = HTTP
 	if sec.Key("PROTOCOL").String() == "https" {
@@ -235,12 +331,11 @@ func NewConfigContext() {
 	Domain = sec.Key("DOMAIN").MustString("localhost")
 	HttpAddr = sec.Key("HTTP_ADDR").MustString("0.0.0.0")
 	HttpPort = sec.Key("HTTP_PORT").MustString("3000")
-	DisableSSH = sec.Key("DISABLE_SSH").MustBool()
-	SSHDomain = sec.Key("SSH_DOMAIN").MustString(Domain)
-	SSHPort = sec.Key("SSH_PORT").MustInt(22)
+	LocalURL = sec.Key("LOCAL_ROOT_URL").MustString("http://localhost:" + HttpPort + "/")
 	OfflineMode = sec.Key("OFFLINE_MODE").MustBool()
 	DisableRouterLog = sec.Key("DISABLE_ROUTER_LOG").MustBool()
 	StaticRootPath = sec.Key("STATIC_ROOT_PATH").MustString(workDir)
+	AppDataPath = sec.Key("APP_DATA_PATH").MustString("data")
 	EnableGzip = sec.Key("ENABLE_GZIP").MustBool()
 
 	switch sec.Key("LANDING_PAGE").MustString("home") {
@@ -248,6 +343,33 @@ func NewConfigContext() {
 		LandingPageUrl = LANDING_PAGE_EXPLORE
 	default:
 		LandingPageUrl = LANDING_PAGE_HOME
+	}
+
+	SSH.RootPath = path.Join(homeDir, ".ssh")
+	SSH.KeyTestPath = os.TempDir()
+	if err = Cfg.Section("server").MapTo(&SSH); err != nil {
+		log.Fatal(4, "Fail to map SSH settings: %v", err)
+	}
+	// When disable SSH, start builtin server value is ignored.
+	if SSH.Disabled {
+		SSH.StartBuiltinServer = false
+	}
+
+	if !SSH.Disabled && !SSH.StartBuiltinServer {
+		if err := os.MkdirAll(SSH.RootPath, 0700); err != nil {
+			log.Fatal(4, "Fail to create '%s': %v", SSH.RootPath, err)
+		} else if err = os.MkdirAll(SSH.KeyTestPath, 0644); err != nil {
+			log.Fatal(4, "Fail to create '%s': %v", SSH.KeyTestPath, err)
+		}
+	}
+
+	SSH.MinimumKeySizeCheck = sec.Key("MINIMUM_KEY_SIZE_CHECK").MustBool()
+	SSH.MinimumKeySizes = map[string]int{}
+	minimumKeySizes := Cfg.Section("ssh.minimum_key_sizes").Keys()
+	for _, key := range minimumKeySizes {
+		if key.MustInt() != -1 {
+			SSH.MinimumKeySizes[strings.ToLower(key.Name())] = key.MustInt()
+		}
 	}
 
 	sec = Cfg.Section("security")
@@ -259,13 +381,13 @@ func NewConfigContext() {
 	ReverseProxyAuthUser = sec.Key("REVERSE_PROXY_AUTHENTICATION_USER").MustString("X-WEBAUTH-USER")
 
 	sec = Cfg.Section("attachment")
-	AttachmentPath = sec.Key("PATH").MustString("data/attachments")
+	AttachmentPath = sec.Key("PATH").MustString(path.Join(AppDataPath, "attachments"))
 	if !filepath.IsAbs(AttachmentPath) {
 		AttachmentPath = path.Join(workDir, AttachmentPath)
 	}
-	AttachmentAllowedTypes = sec.Key("ALLOWED_TYPES").MustString("image/jpeg|image/png")
-	AttachmentMaxSize = sec.Key("MAX_SIZE").MustInt64(32)
-	AttachmentMaxFiles = sec.Key("MAX_FILES").MustInt(10)
+	AttachmentAllowedTypes = strings.Replace(sec.Key("ALLOWED_TYPES").MustString("image/jpeg,image/png"), "|", ",", -1)
+	AttachmentMaxSize = sec.Key("MAX_SIZE").MustInt64(4)
+	AttachmentMaxFiles = sec.Key("MAX_FILES").MustInt(5)
 	AttachmentEnabled = sec.Key("ENABLE").MustBool(true)
 
 	TimeFormat = map[string]string{
@@ -287,22 +409,13 @@ func NewConfigContext() {
 	}[Cfg.Section("time").Key("FORMAT").MustString("RFC1123")]
 
 	RunUser = Cfg.Section("").Key("RUN_USER").String()
-	curUser := os.Getenv("USER")
-	if len(curUser) == 0 {
-		curUser = os.Getenv("USERNAME")
-	}
+	curUser := user.CurrentUsername()
 	// Does not check run user when the install lock is off.
 	if InstallLock && RunUser != curUser {
 		log.Fatal(4, "Expect user(%s) but current user is: %s", RunUser, curUser)
 	}
 
 	// Determine and create root git repository path.
-	homeDir, err := com.HomeDir()
-	if err != nil {
-		log.Fatal(4, "Fail to get home directory: %v", err)
-	}
-	homeDir = strings.Replace(homeDir, "\\", "/", -1)
-
 	sec = Cfg.Section("repository")
 	RepoRootPath = sec.Key("ROOT").MustString(path.Join(homeDir, "gogs-repositories"))
 	forcePathSeparator(RepoRootPath)
@@ -312,36 +425,56 @@ func NewConfigContext() {
 		RepoRootPath = path.Clean(RepoRootPath)
 	}
 	ScriptType = sec.Key("SCRIPT_TYPE").MustString("bash")
+	if err = Cfg.Section("repository").MapTo(&Repository); err != nil {
+		log.Fatal(4, "Fail to map Repository settings: %v", err)
+	}
 
 	// UI settings.
-	IssuePagingNum = Cfg.Section("ui").Key("ISSUE_PAGING_NUM").MustInt(10)
+	sec = Cfg.Section("ui")
+	ExplorePagingNum = sec.Key("EXPLORE_PAGING_NUM").MustInt(20)
+	IssuePagingNum = sec.Key("ISSUE_PAGING_NUM").MustInt(10)
+	FeedMaxCommitNum = sec.Key("FEED_MAX_COMMIT_NUM").MustInt(5)
+
+	sec = Cfg.Section("ui.admin")
+	AdminUserPagingNum = sec.Key("USER_PAGING_NUM").MustInt(50)
+	AdminRepoPagingNum = sec.Key("REPO_PAGING_NUM").MustInt(50)
+	AdminNoticePagingNum = sec.Key("NOTICE_PAGING_NUM").MustInt(50)
+	AdminOrgPagingNum = sec.Key("ORG_PAGING_NUM").MustInt(50)
+	ThemeColorMetaTag = sec.Key("THEME_COLOR_META_TAG").MustString("#ff5343")
 
 	sec = Cfg.Section("picture")
-	PictureService = sec.Key("SERVICE").In("server", []string{"server"})
-	AvatarUploadPath = sec.Key("AVATAR_UPLOAD_PATH").MustString("data/avatars")
+	AvatarUploadPath = sec.Key("AVATAR_UPLOAD_PATH").MustString(path.Join(AppDataPath, "avatars"))
 	forcePathSeparator(AvatarUploadPath)
 	if !filepath.IsAbs(AvatarUploadPath) {
 		AvatarUploadPath = path.Join(workDir, AvatarUploadPath)
 	}
-	switch sec.Key("GRAVATAR_SOURCE").MustString("gravatar") {
+	switch source := sec.Key("GRAVATAR_SOURCE").MustString("gravatar"); source {
 	case "duoshuo":
 		GravatarSource = "http://gravatar.duoshuo.com/avatar/"
+	case "gravatar":
+		GravatarSource = "https://secure.gravatar.com/avatar/"
 	default:
-		GravatarSource = "//1.gravatar.com/avatar/"
+		GravatarSource = source
 	}
 	DisableGravatar = sec.Key("DISABLE_GRAVATAR").MustBool()
 	if OfflineMode {
 		DisableGravatar = true
 	}
 
-	if err = Cfg.Section("git").MapTo(&Git); err != nil {
+	if err = Cfg.Section("markdown").MapTo(&Markdown); err != nil {
+		log.Fatal(4, "Fail to map Markdown settings: %v", err)
+	} else if err = Cfg.Section("git").MapTo(&Git); err != nil {
 		log.Fatal(4, "Fail to map Git settings: %v", err)
+	} else if err = Cfg.Section("cron").MapTo(&Cron); err != nil {
+		log.Fatal(4, "Fail to map Cron settings: %v", err)
 	}
 
 	Langs = Cfg.Section("i18n").Key("LANGS").Strings(",")
 	Names = Cfg.Section("i18n").Key("NAMES").Strings(",")
+	dateLangs = Cfg.Section("i18n.datelang").KeysHash()
 
 	ShowFooterBranding = Cfg.Section("other").Key("SHOW_FOOTER_BRANDING").MustBool()
+	ShowFooterVersion = Cfg.Section("other").Key("SHOW_FOOTER_VERSION").MustBool()
 
 	HasRobotsTxt = com.IsFile(path.Join(CustomPath, "robots.txt"))
 }
@@ -353,11 +486,10 @@ var Service struct {
 	DisableRegistration            bool
 	ShowRegistrationButton         bool
 	RequireSignInView              bool
-	EnableCacheAvatar              bool
 	EnableNotifyMail               bool
 	EnableReverseProxyAuth         bool
 	EnableReverseProxyAutoRegister bool
-	DisableMinimumKeySizeCheck     bool
+	EnableCaptcha                  bool
 }
 
 func newService() {
@@ -367,10 +499,9 @@ func newService() {
 	Service.DisableRegistration = sec.Key("DISABLE_REGISTRATION").MustBool()
 	Service.ShowRegistrationButton = sec.Key("SHOW_REGISTRATION_BUTTON").MustBool(!Service.DisableRegistration)
 	Service.RequireSignInView = sec.Key("REQUIRE_SIGNIN_VIEW").MustBool()
-	Service.EnableCacheAvatar = sec.Key("ENABLE_CACHE_AVATAR").MustBool()
 	Service.EnableReverseProxyAuth = sec.Key("ENABLE_REVERSE_PROXY_AUTHENTICATION").MustBool()
 	Service.EnableReverseProxyAutoRegister = sec.Key("ENABLE_REVERSE_PROXY_AUTO_REGISTRATION").MustBool()
-	Service.DisableMinimumKeySizeCheck = sec.Key("DISABLE_MINIMUM_KEY_SIZE_CHECK").MustBool()
+	Service.EnableCaptcha = sec.Key("ENABLE_CAPTCHA").MustBool()
 }
 
 var logLevels = map[string]string{
@@ -384,6 +515,11 @@ var logLevels = map[string]string{
 
 func newLogService() {
 	log.Info("%s %s", AppName, AppVer)
+
+	if len(BuildTime) > 0 {
+		log.Info("Build Time: %s", BuildTime)
+		log.Info("Build Git Hash: %s", BuildGitHash)
+	}
 
 	// Get and check log mode.
 	LogModes = strings.Split(Cfg.Section("log").Key("MODE").MustString("console"), ",")
@@ -411,7 +547,10 @@ func newLogService() {
 			LogConfigs[i] = fmt.Sprintf(`{"level":%s}`, level)
 		case "file":
 			logPath := sec.Key("FILE_NAME").MustString(path.Join(LogRootPath, "gogs.log"))
-			os.MkdirAll(path.Dir(logPath), os.ModePerm)
+			if err = os.MkdirAll(path.Dir(logPath), os.ModePerm); err != nil {
+				panic(err.Error())
+			}
+
 			LogConfigs[i] = fmt.Sprintf(
 				`{"level":%s,"filename":"%s","rotate":%v,"maxlines":%d,"maxsize":%d,"daily":%v,"maxdays":%d}`, level,
 				logPath,
@@ -446,13 +585,6 @@ func newLogService() {
 
 func newCacheService() {
 	CacheAdapter = Cfg.Section("cache").Key("ADAPTER").In("memory", []string{"memory", "redis", "memcache"})
-	if EnableRedis {
-		log.Info("Redis Enabled")
-	}
-	if EnableMemcache {
-		log.Info("Memcache Enabled")
-	}
-
 	switch CacheAdapter {
 	case "memory":
 		CacheInternal = Cfg.Section("cache").Key("INTERVAL").MustInt(60)
@@ -480,6 +612,7 @@ func newSessionService() {
 
 // Mailer represents mail service.
 type Mailer struct {
+	QueueLength       int
 	Name              string
 	Host              string
 	From              string
@@ -491,21 +624,8 @@ type Mailer struct {
 	CertFile, KeyFile string
 }
 
-type OauthInfo struct {
-	oauth2.Options
-	AuthUrl, TokenUrl string
-}
-
-// Oauther represents oauth service.
-type Oauther struct {
-	GitHub, Google, Tencent,
-	Twitter, Weibo bool
-	OauthInfos map[string]*OauthInfo
-}
-
 var (
-	MailService  *Mailer
-	OauthService *Oauther
+	MailService *Mailer
 )
 
 func newMailService() {
@@ -516,6 +636,7 @@ func newMailService() {
 	}
 
 	MailService = &Mailer{
+		QueueLength:    sec.Key("SEND_BUFFER_LEN").MustInt(100),
 		Name:           sec.Key("NAME").MustString(AppName),
 		Host:           sec.Key("HOST").String(),
 		User:           sec.Key("USER").String(),
@@ -558,6 +679,8 @@ func newWebhookService() {
 	Webhook.QueueLength = sec.Key("QUEUE_LENGTH").MustInt(1000)
 	Webhook.DeliverTimeout = sec.Key("DELIVER_TIMEOUT").MustInt(5)
 	Webhook.SkipTLSVerify = sec.Key("SKIP_TLS_VERIFY").MustBool()
+	Webhook.Types = []string{"gogs", "slack"}
+	Webhook.PagingNum = sec.Key("PAGING_NUM").MustInt(10)
 }
 
 func NewServices() {
@@ -569,5 +692,4 @@ func NewServices() {
 	newRegisterMailService()
 	newNotifyMailService()
 	newWebhookService()
-	// ssh.Listen("2222")
 }

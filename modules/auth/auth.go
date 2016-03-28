@@ -5,47 +5,60 @@
 package auth
 
 import (
-	"net/http"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/Unknwon/com"
-	"github.com/Unknwon/macaron"
-	"github.com/macaron-contrib/binding"
-	"github.com/macaron-contrib/session"
+	"github.com/go-macaron/binding"
+	"github.com/go-macaron/session"
+	gouuid "github.com/satori/go.uuid"
+	"gopkg.in/macaron.v1"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
 	"github.com/gogits/gogs/modules/log"
 	"github.com/gogits/gogs/modules/setting"
-	"github.com/gogits/gogs/modules/uuid"
 )
 
 func IsAPIPath(url string) bool {
 	return strings.HasPrefix(url, "/api/")
 }
 
-// SignedInId returns the id of signed in user.
-func SignedInId(req *http.Request, sess session.Store) int64 {
+// SignedInID returns the id of signed in user.
+func SignedInID(ctx *macaron.Context, sess session.Store) int64 {
 	if !models.HasEngine {
 		return 0
 	}
 
-	// API calls need to check access token.
-	if IsAPIPath(req.URL.Path) {
-		auHead := req.Header.Get("Authorization")
-		if len(auHead) > 0 {
-			auths := strings.Fields(auHead)
-			if len(auths) == 2 && auths[0] == "token" {
-				t, err := models.GetAccessTokenBySha(auths[1])
-				if err != nil {
-					if err != models.ErrAccessTokenNotExist {
-						log.Error(4, "GetAccessTokenBySha: %v", err)
-					}
-					return 0
+	// Check access token.
+	if IsAPIPath(ctx.Req.URL.Path) {
+		tokenSHA := ctx.Query("token")
+		if len(tokenSHA) == 0 {
+			// Well, check with header again.
+			auHead := ctx.Req.Header.Get("Authorization")
+			if len(auHead) > 0 {
+				auths := strings.Fields(auHead)
+				if len(auths) == 2 && auths[0] == "token" {
+					tokenSHA = auths[1]
 				}
-				return t.Uid
 			}
+		}
+
+		// Let's see if token is valid.
+		if len(tokenSHA) > 0 {
+			t, err := models.GetAccessTokenBySHA(tokenSHA)
+			if err != nil {
+				if models.IsErrAccessTokenNotExist(err) {
+					log.Error(4, "GetAccessTokenBySHA: %v", err)
+				}
+				return 0
+			}
+			t.Updated = time.Now()
+			if err = models.UpdateAccessToken(t); err != nil {
+				log.Error(4, "UpdateAccessToken: %v", err)
+			}
+			return t.UID
 		}
 	}
 
@@ -54,8 +67,8 @@ func SignedInId(req *http.Request, sess session.Store) int64 {
 		return 0
 	}
 	if id, ok := uid.(int64); ok {
-		if _, err := models.GetUserById(id); err != nil {
-			if err != models.ErrUserNotExist {
+		if _, err := models.GetUserByID(id); err != nil {
+			if !models.IsErrUserNotExist(err) {
 				log.Error(4, "GetUserById: %v", err)
 			}
 			return 0
@@ -67,20 +80,20 @@ func SignedInId(req *http.Request, sess session.Store) int64 {
 
 // SignedInUser returns the user object of signed user.
 // It returns a bool value to indicate whether user uses basic auth or not.
-func SignedInUser(req *http.Request, sess session.Store) (*models.User, bool) {
+func SignedInUser(ctx *macaron.Context, sess session.Store) (*models.User, bool) {
 	if !models.HasEngine {
 		return nil, false
 	}
 
-	uid := SignedInId(req, sess)
+	uid := SignedInID(ctx, sess)
 
 	if uid <= 0 {
 		if setting.Service.EnableReverseProxyAuth {
-			webAuthUser := req.Header.Get(setting.ReverseProxyAuthUser)
+			webAuthUser := ctx.Req.Header.Get(setting.ReverseProxyAuthUser)
 			if len(webAuthUser) > 0 {
 				u, err := models.GetUserByName(webAuthUser)
 				if err != nil {
-					if err != models.ErrUserNotExist {
+					if !models.IsErrUserNotExist(err) {
 						log.Error(4, "GetUserByName: %v", err)
 						return nil, false
 					}
@@ -89,7 +102,7 @@ func SignedInUser(req *http.Request, sess session.Store) (*models.User, bool) {
 					if setting.Service.EnableReverseProxyAutoRegister {
 						u := &models.User{
 							Name:     webAuthUser,
-							Email:    uuid.NewV4().String() + "@localhost",
+							Email:    gouuid.NewV4().String() + "@localhost",
 							Passwd:   webAuthUser,
 							IsActive: true,
 						}
@@ -107,7 +120,7 @@ func SignedInUser(req *http.Request, sess session.Store) (*models.User, bool) {
 		}
 
 		// Check with basic auth.
-		baHead := req.Header.Get("Authorization")
+		baHead := ctx.Req.Header.Get("Authorization")
 		if len(baHead) > 0 {
 			auths := strings.Fields(baHead)
 			if len(auths) == 2 && auths[0] == "Basic" {
@@ -115,7 +128,7 @@ func SignedInUser(req *http.Request, sess session.Store) (*models.User, bool) {
 
 				u, err := models.UserSignIn(uname, passwd)
 				if err != nil {
-					if err != models.ErrUserNotExist {
+					if !models.IsErrUserNotExist(err) {
 						log.Error(4, "UserSignIn: %v", err)
 					}
 					return nil, false
@@ -127,7 +140,7 @@ func SignedInUser(req *http.Request, sess session.Store) (*models.User, bool) {
 		return nil, false
 	}
 
-	u, err := models.GetUserById(uid)
+	u, err := models.GetUserByID(uid)
 	if err != nil {
 		log.Error(4, "GetUserById: %v", err)
 		return nil, false
@@ -168,7 +181,7 @@ func AssignForm(form interface{}, data map[string]interface{}) {
 	}
 }
 
-func getSize(field reflect.StructField, prefix string) string {
+func getRuleBody(field reflect.StructField, prefix string) string {
 	for _, rule := range strings.Split(field.Tag.Get("binding"), ";") {
 		if strings.HasPrefix(rule, prefix) {
 			return rule[len(prefix) : len(rule)-1]
@@ -178,15 +191,25 @@ func getSize(field reflect.StructField, prefix string) string {
 }
 
 func GetSize(field reflect.StructField) string {
-	return getSize(field, "Size(")
+	return getRuleBody(field, "Size(")
 }
 
 func GetMinSize(field reflect.StructField) string {
-	return getSize(field, "MinSize(")
+	return getRuleBody(field, "MinSize(")
 }
 
 func GetMaxSize(field reflect.StructField) string {
-	return getSize(field, "MaxSize(")
+	return getRuleBody(field, "MaxSize(")
+}
+
+func GetInclude(field reflect.StructField) string {
+	return getRuleBody(field, "Include(")
+}
+
+// FIXME: struct contains a struct
+func validateStruct(obj interface{}) binding.Errors {
+
+	return nil
 }
 
 func validate(errs binding.Errors, data map[string]interface{}, f Form, l macaron.Locale) binding.Errors {
@@ -241,6 +264,8 @@ func validate(errs binding.Errors, data map[string]interface{}, f Form, l macaro
 				data["ErrorMsg"] = trName + l.Tr("form.email_error")
 			case binding.ERR_URL:
 				data["ErrorMsg"] = trName + l.Tr("form.url_error")
+			case binding.ERR_INCLUDE:
+				data["ErrorMsg"] = trName + l.Tr("form.include_error", GetInclude(field))
 			default:
 				data["ErrorMsg"] = l.Tr("form.unknown_error") + " " + errs[0].Classification
 			}

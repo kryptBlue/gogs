@@ -7,26 +7,46 @@ package admin
 import (
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/log"
+	"github.com/gogits/gogs/modules/setting"
+	"github.com/gogits/gogs/routers"
 )
 
 const (
 	REPOS base.TplName = "admin/repo/list"
 )
 
-func Repositories(ctx *middleware.Context) {
+func Repos(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("admin.repositories")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminRepositories"] = true
 
-	pageNum := 50
-	p := pagination(ctx, models.CountRepositories(), pageNum)
+	routers.RenderRepoSearch(ctx, &routers.RepoSearchOptions{
+		Counter:  models.CountRepositories,
+		Ranger:   models.Repositories,
+		Private:  true,
+		PageSize: setting.AdminRepoPagingNum,
+		OrderBy:  "id ASC",
+		TplName:  REPOS,
+	})
+}
 
-	var err error
-	ctx.Data["Repos"], err = models.GetRepositoriesWithUsers(pageNum, (p-1)*pageNum)
+func DeleteRepo(ctx *context.Context) {
+	repo, err := models.GetRepositoryByID(ctx.QueryInt64("id"))
 	if err != nil {
-		ctx.Handle(500, "GetRepositoriesWithUsers", err)
+		ctx.Handle(500, "GetRepositoryByID", err)
 		return
 	}
-	ctx.HTML(200, REPOS)
+
+	if err := models.DeleteRepository(repo.MustOwner().Id, repo.ID); err != nil {
+		ctx.Handle(500, "DeleteRepository", err)
+		return
+	}
+	log.Trace("Repository deleted: %s/%s", repo.MustOwner().Name, repo.Name)
+
+	ctx.Flash.Success(ctx.Tr("repo.settings.deletion_success"))
+	ctx.JSON(200, map[string]interface{}{
+		"redirect": setting.AppSubUrl + "/admin/repos?page=" + ctx.Query("page"),
+	})
 }

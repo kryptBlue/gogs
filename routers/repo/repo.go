@@ -6,57 +6,74 @@ package repo
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"path"
 	"strings"
 
 	"github.com/Unknwon/com"
 
+	"github.com/gogits/git-module"
+
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/auth"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/git"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
 	"github.com/gogits/gogs/modules/setting"
 )
 
 const (
 	CREATE  base.TplName = "repo/create"
 	MIGRATE base.TplName = "repo/migrate"
-	FORK    base.TplName = "repo/fork"
 )
 
-func checkContextUser(ctx *middleware.Context, uid int64) *models.User {
+func MustBeNotBare(ctx *context.Context) {
+	if ctx.Repo.Repository.IsBare {
+		ctx.Handle(404, "MustBeNotBare", nil)
+	}
+}
+
+func checkContextUser(ctx *context.Context, uid int64) *models.User {
+	orgs, err := models.GetOwnedOrgsByUserIDDesc(ctx.User.Id, "updated_unix")
+	if err != nil {
+		ctx.Handle(500, "GetOwnedOrgsByUserIDDesc", err)
+		return nil
+	}
+	ctx.Data["Orgs"] = orgs
+
 	// Not equal means current user is an organization.
 	if uid == ctx.User.Id || uid == 0 {
 		return ctx.User
 	}
 
-	org, err := models.GetUserById(uid)
-	if err == models.ErrUserNotExist {
+	org, err := models.GetUserByID(uid)
+	if models.IsErrUserNotExist(err) {
 		return ctx.User
 	}
 
 	if err != nil {
-		ctx.Handle(500, "checkContextUser", fmt.Errorf("GetUserById(%d): %v", uid, err))
+		ctx.Handle(500, "GetUserByID", fmt.Errorf("[%d]: %v", uid, err))
 		return nil
-	} else if !org.IsOrganization() {
+	}
+
+	// Check ownership of organization.
+	if !org.IsOrganization() || !(ctx.User.IsAdmin || org.IsOwnedBy(ctx.User.Id)) {
 		ctx.Error(403)
 		return nil
 	}
 	return org
 }
 
-func Create(ctx *middleware.Context) {
+func Create(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("new_repo")
 
 	// Give default value for template to render.
-	ctx.Data["gitignore"] = "0"
-	ctx.Data["license"] = "0"
 	ctx.Data["Gitignores"] = models.Gitignores
 	ctx.Data["Licenses"] = models.Licenses
+	ctx.Data["Readmes"] = models.Readmes
+	ctx.Data["readme"] = "Default"
+	ctx.Data["private"] = ctx.User.LastRepoVisibility
+	ctx.Data["IsForcedPrivate"] = setting.Repository.ForcePrivate
 
 	ctxUser := checkContextUser(ctx, ctx.QueryInt64("org"))
 	if ctx.Written() {
@@ -64,77 +81,74 @@ func Create(ctx *middleware.Context) {
 	}
 	ctx.Data["ContextUser"] = ctxUser
 
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
-
 	ctx.HTML(200, CREATE)
 }
 
-func CreatePost(ctx *middleware.Context, form auth.CreateRepoForm) {
+func handleCreateError(ctx *context.Context, owner *models.User, err error, name string, tpl base.TplName, form interface{}) {
+	switch {
+	case models.IsErrReachLimitOfRepo(err):
+		ctx.RenderWithErr(ctx.Tr("repo.form.reach_limit_of_creation", owner.RepoCreationNum()), tpl, form)
+	case models.IsErrRepoAlreadyExist(err):
+		ctx.Data["Err_RepoName"] = true
+		ctx.RenderWithErr(ctx.Tr("form.repo_name_been_taken"), tpl, form)
+	case models.IsErrNameReserved(err):
+		ctx.Data["Err_RepoName"] = true
+		ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), tpl, form)
+	case models.IsErrNamePatternNotAllowed(err):
+		ctx.Data["Err_RepoName"] = true
+		ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), tpl, form)
+	default:
+		ctx.Handle(500, name, err)
+	}
+}
+
+func CreatePost(ctx *context.Context, form auth.CreateRepoForm) {
 	ctx.Data["Title"] = ctx.Tr("new_repo")
 
 	ctx.Data["Gitignores"] = models.Gitignores
 	ctx.Data["Licenses"] = models.Licenses
+	ctx.Data["Readmes"] = models.Readmes
 
 	ctxUser := checkContextUser(ctx, form.Uid)
 	if ctx.Written() {
 		return
 	}
 	ctx.Data["ContextUser"] = ctxUser
-
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
 
 	if ctx.HasError() {
 		ctx.HTML(200, CREATE)
 		return
 	}
 
-	if ctxUser.IsOrganization() {
-		// Check ownership of organization.
-		if !ctxUser.IsOwnedBy(ctx.User.Id) {
-			ctx.Error(403)
-			return
-		}
-	}
-
-	repo, err := models.CreateRepository(ctxUser, form.RepoName, form.Description,
-		form.Gitignore, form.License, form.Private, false, form.AutoInit)
+	repo, err := models.CreateRepository(ctxUser, models.CreateRepoOptions{
+		Name:        form.RepoName,
+		Description: form.Description,
+		Gitignores:  form.Gitignores,
+		License:     form.License,
+		Readme:      form.Readme,
+		IsPrivate:   form.Private || setting.Repository.ForcePrivate,
+		AutoInit:    form.AutoInit,
+	})
 	if err == nil {
-		log.Trace("Repository created: %s/%s", ctxUser.Name, repo.Name)
+		log.Trace("Repository created[%d]: %s/%s", repo.ID, ctxUser.Name, repo.Name)
 		ctx.Redirect(setting.AppSubUrl + "/" + ctxUser.Name + "/" + repo.Name)
 		return
 	}
 
 	if repo != nil {
-		if errDelete := models.DeleteRepository(ctxUser.Id, repo.Id, ctxUser.Name); errDelete != nil {
+		if errDelete := models.DeleteRepository(ctxUser.Id, repo.ID); errDelete != nil {
 			log.Error(4, "DeleteRepository: %v", errDelete)
 		}
 	}
 
-	switch {
-	case err == models.ErrRepoAlreadyExist:
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("form.repo_name_been_taken"), CREATE, &form)
-	case models.IsErrNameReserved(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), CREATE, &form)
-	case models.IsErrNamePatternNotAllowed(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), CREATE, &form)
-	default:
-		ctx.Handle(500, "CreatePost", err)
-	}
+	handleCreateError(ctx, ctxUser, err, "CreatePost", CREATE, &form)
 }
 
-func Migrate(ctx *middleware.Context) {
+func Migrate(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("new_migrate")
+	ctx.Data["private"] = ctx.User.LastRepoVisibility
+	ctx.Data["IsForcedPrivate"] = setting.Repository.ForcePrivate
+	ctx.Data["mirror"] = ctx.Query("mirror") == "1"
 
 	ctxUser := checkContextUser(ctx, ctx.QueryInt64("org"))
 	if ctx.Written() {
@@ -142,16 +156,10 @@ func Migrate(ctx *middleware.Context) {
 	}
 	ctx.Data["ContextUser"] = ctxUser
 
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
-
 	ctx.HTML(200, MIGRATE)
 }
 
-func MigratePost(ctx *middleware.Context, form auth.MigrateRepoForm) {
+func MigratePost(ctx *context.Context, form auth.MigrateRepoForm) {
 	ctx.Data["Title"] = ctx.Tr("new_migrate")
 
 	ctxUser := checkContextUser(ctx, form.Uid)
@@ -159,203 +167,78 @@ func MigratePost(ctx *middleware.Context, form auth.MigrateRepoForm) {
 		return
 	}
 	ctx.Data["ContextUser"] = ctxUser
-
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
 
 	if ctx.HasError() {
 		ctx.HTML(200, MIGRATE)
 		return
 	}
 
-	if ctxUser.IsOrganization() {
-		// Check ownership of organization.
-		if !ctxUser.IsOwnedBy(ctx.User.Id) {
-			ctx.Error(403)
-			return
-		}
-	}
-
-	// Remote address can be HTTP/HTTPS/Git URL or local path.
-	// Note: remember to change api/v1/repo.go: MigrateRepo
-	// FIXME: merge these two functions with better error handling
-	remoteAddr := form.CloneAddr
-	if strings.HasPrefix(form.CloneAddr, "http://") ||
-		strings.HasPrefix(form.CloneAddr, "https://") ||
-		strings.HasPrefix(form.CloneAddr, "git://") {
-		u, err := url.Parse(form.CloneAddr)
-		if err != nil {
+	remoteAddr, err := form.ParseRemoteAddr(ctx.User)
+	if err != nil {
+		if models.IsErrInvalidCloneAddr(err) {
 			ctx.Data["Err_CloneAddr"] = true
-			ctx.RenderWithErr(ctx.Tr("form.url_error"), MIGRATE, &form)
-			return
+			addrErr := err.(models.ErrInvalidCloneAddr)
+			switch {
+			case addrErr.IsURLError:
+				ctx.RenderWithErr(ctx.Tr("form.url_error"), MIGRATE, &form)
+			case addrErr.IsPermissionDenied:
+				ctx.RenderWithErr(ctx.Tr("repo.migrate.permission_denied"), MIGRATE, &form)
+			case addrErr.IsInvalidPath:
+				ctx.RenderWithErr(ctx.Tr("repo.migrate.invalid_local_path"), MIGRATE, &form)
+			default:
+				ctx.Handle(500, "Unknown error", err)
+			}
+		} else {
+			ctx.Handle(500, "ParseRemoteAddr", err)
 		}
-		if len(form.AuthUsername) > 0 || len(form.AuthPassword) > 0 {
-			u.User = url.UserPassword(form.AuthUsername, form.AuthPassword)
-		}
-		remoteAddr = u.String()
-	} else if !com.IsDir(remoteAddr) {
-		ctx.Data["Err_CloneAddr"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.migrate.invalid_local_path"), MIGRATE, &form)
 		return
 	}
 
-	repo, err := models.MigrateRepository(ctxUser, form.RepoName, form.Description, form.Private, form.Mirror, remoteAddr)
+	repo, err := models.MigrateRepository(ctxUser, models.MigrateRepoOptions{
+		Name:        form.RepoName,
+		Description: form.Description,
+		IsPrivate:   form.Private || setting.Repository.ForcePrivate,
+		IsMirror:    form.Mirror,
+		RemoteAddr:  remoteAddr,
+	})
 	if err == nil {
-		log.Trace("Repository migrated: %s/%s", ctxUser.Name, form.RepoName)
+		log.Trace("Repository migrated [%d]: %s/%s", repo.ID, ctxUser.Name, form.RepoName)
 		ctx.Redirect(setting.AppSubUrl + "/" + ctxUser.Name + "/" + form.RepoName)
 		return
 	}
 
 	if repo != nil {
-		if errDelete := models.DeleteRepository(ctxUser.Id, repo.Id, ctxUser.Name); errDelete != nil {
+		if errDelete := models.DeleteRepository(ctxUser.Id, repo.ID); errDelete != nil {
 			log.Error(4, "DeleteRepository: %v", errDelete)
 		}
 	}
 
-	if strings.Contains(err.Error(), "Authentication failed") {
+	if strings.Contains(err.Error(), "Authentication failed") ||
+		strings.Contains(err.Error(), "could not read Username") {
 		ctx.Data["Err_Auth"] = true
-		ctx.RenderWithErr(ctx.Tr("form.auth_failed", err), MIGRATE, &form)
+		ctx.RenderWithErr(ctx.Tr("form.auth_failed", models.HandleCloneUserCredentials(err.Error(), true)), MIGRATE, &form)
+		return
+	} else if strings.Contains(err.Error(), "fatal:") {
+		ctx.Data["Err_CloneAddr"] = true
+		ctx.RenderWithErr(ctx.Tr("repo.migrate.failed", models.HandleCloneUserCredentials(err.Error(), true)), MIGRATE, &form)
 		return
 	}
 
-	switch {
-	case err == models.ErrRepoAlreadyExist:
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("form.repo_name_been_taken"), MIGRATE, &form)
-	case models.IsErrNameReserved(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), MIGRATE, &form)
-	case models.IsErrNamePatternNotAllowed(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), MIGRATE, &form)
-	default:
-		ctx.Handle(500, "MigratePost", err)
-	}
+	handleCreateError(ctx, ctxUser, err, "MigratePost", MIGRATE, &form)
 }
 
-func getForkRepository(ctx *middleware.Context) (*models.Repository, error) {
-	forkId := ctx.QueryInt64("fork_id")
-	ctx.Data["ForkId"] = forkId
-
-	forkRepo, err := models.GetRepositoryById(forkId)
-	if err != nil {
-		return nil, fmt.Errorf("GetRepositoryById: %v", err)
-	}
-	ctx.Data["repo_name"] = forkRepo.Name
-	ctx.Data["desc"] = forkRepo.Description
-
-	if err = forkRepo.GetOwner(); err != nil {
-		return nil, fmt.Errorf("GetOwner: %v", err)
-	}
-	ctx.Data["ForkFrom"] = forkRepo.Owner.Name + "/" + forkRepo.Name
-	return forkRepo, nil
-}
-
-func Fork(ctx *middleware.Context) {
-	ctx.Data["Title"] = ctx.Tr("new_fork")
-
-	if _, err := getForkRepository(ctx); err != nil {
-		if models.IsErrRepoNotExist(err) {
-			ctx.Redirect(setting.AppSubUrl + "/")
-		} else {
-			ctx.Handle(500, "getForkRepository", err)
-		}
-		return
-	}
-
-	// FIXME: maybe sometime can directly fork to organization?
-	ctx.Data["ContextUser"] = ctx.User
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
-
-	ctx.HTML(200, FORK)
-}
-
-func ForkPost(ctx *middleware.Context, form auth.CreateRepoForm) {
-	ctx.Data["Title"] = ctx.Tr("new_fork")
-
-	forkRepo, err := getForkRepository(ctx)
-	if err != nil {
-		if models.IsErrRepoNotExist(err) {
-			ctx.Redirect(setting.AppSubUrl + "/")
-		} else {
-			ctx.Handle(500, "getForkRepository", err)
-		}
-		return
-	}
-
-	ctxUser := checkContextUser(ctx, form.Uid)
-	if ctx.Written() {
-		return
-	}
-	ctx.Data["ContextUser"] = ctxUser
-
-	if err := ctx.User.GetOrganizations(); err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.Data["Orgs"] = ctx.User.Orgs
-
-	if ctx.HasError() {
-		ctx.HTML(200, CREATE)
-		return
-	}
-
-	if ctxUser.IsOrganization() {
-		// Check ownership of organization.
-		if !ctxUser.IsOwnedBy(ctx.User.Id) {
-			ctx.Error(403)
-			return
-		}
-	}
-
-	repo, err := models.ForkRepository(ctxUser, forkRepo, form.RepoName, form.Description)
-	if err == nil {
-		log.Trace("Repository forked: %s/%s", ctxUser.Name, repo.Name)
-		ctx.Redirect(setting.AppSubUrl + "/" + ctxUser.Name + "/" + repo.Name)
-		return
-	}
-
-	if repo != nil {
-		if errDelete := models.DeleteRepository(ctxUser.Id, repo.Id, ctxUser.Name); errDelete != nil {
-			log.Error(4, "DeleteRepository: %v", errDelete)
-		}
-	}
-
-	// FIXME: merge this with other 2 error handling in to one.
-	switch {
-	case err == models.ErrRepoAlreadyExist:
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("form.repo_name_been_taken"), FORK, &form)
-	case models.IsErrNameReserved(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_reserved", err.(models.ErrNameReserved).Name), FORK, &form)
-	case models.IsErrNamePatternNotAllowed(err):
-		ctx.Data["Err_RepoName"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.form.name_pattern_not_allowed", err.(models.ErrNamePatternNotAllowed).Pattern), FORK, &form)
-	default:
-		ctx.Handle(500, "ForkPost", err)
-	}
-}
-
-func Action(ctx *middleware.Context) {
+func Action(ctx *context.Context) {
 	var err error
 	switch ctx.Params(":action") {
 	case "watch":
-		err = models.WatchRepo(ctx.User.Id, ctx.Repo.Repository.Id, true)
+		err = models.WatchRepo(ctx.User.Id, ctx.Repo.Repository.ID, true)
 	case "unwatch":
-		err = models.WatchRepo(ctx.User.Id, ctx.Repo.Repository.Id, false)
+		err = models.WatchRepo(ctx.User.Id, ctx.Repo.Repository.ID, false)
 	case "star":
-		err = models.StarRepo(ctx.User.Id, ctx.Repo.Repository.Id, true)
+		err = models.StarRepo(ctx.User.Id, ctx.Repo.Repository.ID, true)
 	case "unstar":
-		err = models.StarRepo(ctx.User.Id, ctx.Repo.Repository.Id, false)
-	case "desc":
+		err = models.StarRepo(ctx.User.Id, ctx.Repo.Repository.ID, false)
+	case "desc": // FIXME: this is not used
 		if !ctx.Repo.IsOwner() {
 			ctx.Error(404)
 			return
@@ -367,11 +250,7 @@ func Action(ctx *middleware.Context) {
 	}
 
 	if err != nil {
-		log.Error(4, "Action(%s): %v", ctx.Params(":action"), err)
-		ctx.JSON(200, map[string]interface{}{
-			"ok":  false,
-			"err": err.Error(),
-		})
+		ctx.Handle(500, fmt.Sprintf("Action (%s)", ctx.Params(":action")), err)
 		return
 	}
 
@@ -380,14 +259,9 @@ func Action(ctx *middleware.Context) {
 		redirectTo = ctx.Repo.RepoLink
 	}
 	ctx.Redirect(redirectTo)
-
-	return
-	ctx.JSON(200, map[string]interface{}{
-		"ok": true,
-	})
 }
 
-func Download(ctx *middleware.Context) {
+func Download(ctx *context.Context) {
 	var (
 		uri         = ctx.Params("*")
 		refName     string
@@ -406,6 +280,7 @@ func Download(ctx *middleware.Context) {
 		archivePath = path.Join(ctx.Repo.GitRepo.Path, "archives/targz")
 		archiveType = git.TARGZ
 	default:
+		log.Trace("Unknown format: %s", uri)
 		ctx.Error(404)
 		return
 	}
@@ -425,29 +300,29 @@ func Download(ctx *middleware.Context) {
 	)
 	gitRepo := ctx.Repo.GitRepo
 	if gitRepo.IsBranchExist(refName) {
-		commit, err = gitRepo.GetCommitOfBranch(refName)
+		commit, err = gitRepo.GetBranchCommit(refName)
 		if err != nil {
-			ctx.Handle(500, "Download", err)
+			ctx.Handle(500, "GetBranchCommit", err)
 			return
 		}
 	} else if gitRepo.IsTagExist(refName) {
-		commit, err = gitRepo.GetCommitOfTag(refName)
+		commit, err = gitRepo.GetTagCommit(refName)
 		if err != nil {
-			ctx.Handle(500, "Download", err)
+			ctx.Handle(500, "GetTagCommit", err)
 			return
 		}
 	} else if len(refName) == 40 {
 		commit, err = gitRepo.GetCommit(refName)
 		if err != nil {
-			ctx.Handle(404, "Download", nil)
+			ctx.Handle(404, "GetCommit", nil)
 			return
 		}
 	} else {
-		ctx.Error(404)
+		ctx.Handle(404, "Download", nil)
 		return
 	}
 
-	archivePath = path.Join(archivePath, base.ShortSha(commit.Id.String())+ext)
+	archivePath = path.Join(archivePath, base.ShortSha(commit.ID.String())+ext)
 	if !com.IsFile(archivePath) {
 		if err := commit.CreateArchive(archivePath, archiveType); err != nil {
 			ctx.Handle(500, "Download -> CreateArchive "+archivePath, err)
@@ -455,5 +330,5 @@ func Download(ctx *middleware.Context) {
 		}
 	}
 
-	ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+"-"+base.ShortSha(commit.Id.String())+ext)
+	ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+"-"+refName+ext)
 }

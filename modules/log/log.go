@@ -33,10 +33,11 @@ func NewLogger(bufLen int64, mode, config string) {
 		loggers = append(loggers, logger)
 	}
 	if err := logger.SetLogger(mode, config); err != nil {
-		Fatal(1, "Fail to set logger(%s): %v", mode, err)
+		Fatal(2, "Fail to set logger (%s): %v", mode, err)
 	}
 }
 
+// FIXME: use same log level as other loggers.
 func NewGitLogger(logPath string) {
 	os.MkdirAll(path.Dir(logPath), os.ModePerm)
 	GitLogger = newLogger(0)

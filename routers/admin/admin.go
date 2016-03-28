@@ -11,12 +11,13 @@ import (
 	"time"
 
 	"github.com/Unknwon/com"
-	"github.com/Unknwon/macaron"
+	"gopkg.in/macaron.v1"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/cron"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/mailer"
 	"github.com/gogits/gogs/modules/process"
 	"github.com/gogits/gogs/modules/setting"
 )
@@ -114,15 +115,16 @@ func updateSystemStatus() {
 type AdminOperation int
 
 const (
-	CLEAN_UNBIND_OAUTH AdminOperation = iota + 1
-	CLEAN_INACTIVATE_USER
+	CLEAN_INACTIVATE_USER AdminOperation = iota + 1
 	CLEAN_REPO_ARCHIVES
+	CLEAN_MISSING_REPOS
 	GIT_GC_REPOS
 	SYNC_SSH_AUTHORIZED_KEY
 	SYNC_REPOSITORY_UPDATE_HOOK
+	REINIT_MISSING_REPOSITORY
 )
 
-func Dashboard(ctx *middleware.Context) {
+func Dashboard(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("admin.dashboard")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminDashboard"] = true
@@ -134,15 +136,15 @@ func Dashboard(ctx *middleware.Context) {
 		var success string
 
 		switch AdminOperation(op) {
-		case CLEAN_UNBIND_OAUTH:
-			success = ctx.Tr("admin.dashboard.clean_unbind_oauth_success")
-			err = models.CleanUnbindOauth()
 		case CLEAN_INACTIVATE_USER:
 			success = ctx.Tr("admin.dashboard.delete_inactivate_accounts_success")
 			err = models.DeleteInactivateUsers()
 		case CLEAN_REPO_ARCHIVES:
 			success = ctx.Tr("admin.dashboard.delete_repo_archives_success")
 			err = models.DeleteRepositoryArchives()
+		case CLEAN_MISSING_REPOS:
+			success = ctx.Tr("admin.dashboard.delete_missing_repos_success")
+			err = models.DeleteMissingRepositories()
 		case GIT_GC_REPOS:
 			success = ctx.Tr("admin.dashboard.git_gc_repos_success")
 			err = models.GitGcRepos()
@@ -152,6 +154,9 @@ func Dashboard(ctx *middleware.Context) {
 		case SYNC_REPOSITORY_UPDATE_HOOK:
 			success = ctx.Tr("admin.dashboard.resync_all_update_hooks_success")
 			err = models.RewriteRepositoryUpdateHook()
+		case REINIT_MISSING_REPOSITORY:
+			success = ctx.Tr("admin.dashboard.reinit_missing_repos_success")
+			err = models.ReinitMissingRepositories()
 		}
 
 		if err != nil {
@@ -170,8 +175,20 @@ func Dashboard(ctx *middleware.Context) {
 	ctx.HTML(200, DASHBOARD)
 }
 
-func Config(ctx *middleware.Context) {
-	ctx.Data["Title"] = ctx.Tr("admin.users")
+func SendTestMail(ctx *context.Context) {
+	email := ctx.Query("email")
+	// Send a test email to the user's email address and redirect back to Config
+	if err := mailer.SendTestMail(email); err != nil {
+		ctx.Flash.Error(ctx.Tr("admin.config.test_mail_failed", email, err))
+	} else {
+		ctx.Flash.Info(ctx.Tr("admin.config.test_mail_sent", email))
+	}
+
+	ctx.Redirect(setting.AppSubUrl + "/admin/config")
+}
+
+func Config(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.config")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminConfig"] = true
 
@@ -187,6 +204,8 @@ func Config(ctx *middleware.Context) {
 	ctx.Data["ScriptType"] = setting.ScriptType
 	ctx.Data["ReverseProxyAuthUser"] = setting.ReverseProxyAuthUser
 
+	ctx.Data["SSH"] = setting.SSH
+
 	ctx.Data["Service"] = setting.Service
 	ctx.Data["DbCfg"] = models.DbCfg
 	ctx.Data["Webhook"] = setting.Webhook
@@ -197,19 +216,12 @@ func Config(ctx *middleware.Context) {
 		ctx.Data["Mailer"] = setting.MailService
 	}
 
-	ctx.Data["OauthEnabled"] = false
-	if setting.OauthService != nil {
-		ctx.Data["OauthEnabled"] = true
-		ctx.Data["Oauther"] = setting.OauthService
-	}
-
 	ctx.Data["CacheAdapter"] = setting.CacheAdapter
 	ctx.Data["CacheInternal"] = setting.CacheInternal
 	ctx.Data["CacheConn"] = setting.CacheConn
 
 	ctx.Data["SessionConfig"] = setting.SessionConfig
 
-	ctx.Data["PictureService"] = setting.PictureService
 	ctx.Data["DisableGravatar"] = setting.DisableGravatar
 
 	type logger struct {
@@ -224,11 +236,11 @@ func Config(ctx *middleware.Context) {
 	ctx.HTML(200, CONFIG)
 }
 
-func Monitor(ctx *middleware.Context) {
+func Monitor(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("admin.monitor")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminMonitor"] = true
 	ctx.Data["Processes"] = process.Processes
-	ctx.Data["Entries"] = cron.ListEntries()
+	ctx.Data["Entries"] = cron.ListTasks()
 	ctx.HTML(200, MONITOR)
 }

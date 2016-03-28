@@ -1,13 +1,11 @@
 .install {
 	padding-top: 45px;
-	padding-bottom: @footer-margin * 3;
-	.attached.header {
-		background: #f0f0f0;
-	}
+	padding-bottom: @footer-margin * 2;
 	form {
+		@input-padding: 320px !important;
 		label {
 			text-align: right;
-			width: 40% !important;
+			width: @input-padding;
 		}
 		input {
 			width: 35% !important;
@@ -15,7 +13,7 @@
 		.field {
 			text-align: left;
 			.help {
-				margin-left: 41%;
+				margin-left: @input-padding+15px;
 			}
 			&.optional .title {
 				margin-left: 38%;

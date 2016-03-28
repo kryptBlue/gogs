@@ -9,8 +9,8 @@ import (
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
+	"github.com/gogits/gogs/modules/context"
 	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware"
 	"github.com/gogits/gogs/modules/setting"
 )
 
@@ -19,7 +19,7 @@ const (
 	MEMBER_INVITE base.TplName = "org/member/invite"
 )
 
-func Members(ctx *middleware.Context) {
+func Members(ctx *context.Context) {
 	org := ctx.Org.Organization
 	ctx.Data["Title"] = org.FullName
 	ctx.Data["PageIsOrgMembers"] = true
@@ -33,7 +33,7 @@ func Members(ctx *middleware.Context) {
 	ctx.HTML(200, MEMBERS)
 }
 
-func MembersAction(ctx *middleware.Context) {
+func MembersAction(ctx *context.Context) {
 	uid := com.StrTo(ctx.Query("uid")).MustInt64()
 	if uid == 0 {
 		ctx.Redirect(ctx.Org.OrgLink + "/members")
@@ -50,7 +50,7 @@ func MembersAction(ctx *middleware.Context) {
 		}
 		err = models.ChangeOrgUserStatus(org.Id, uid, false)
 	case "public":
-		if ctx.User.Id != uid {
+		if ctx.User.Id != uid && !ctx.Org.IsOwner {
 			ctx.Error(404)
 			return
 		}
@@ -91,7 +91,7 @@ func MembersAction(ctx *middleware.Context) {
 	}
 }
 
-func Invitation(ctx *middleware.Context) {
+func Invitation(ctx *context.Context) {
 	org := ctx.Org.Organization
 	ctx.Data["Title"] = org.FullName
 	ctx.Data["PageIsOrgMembers"] = true
@@ -100,7 +100,7 @@ func Invitation(ctx *middleware.Context) {
 		uname := ctx.Query("uname")
 		u, err := models.GetUserByName(uname)
 		if err != nil {
-			if err == models.ErrUserNotExist {
+			if models.IsErrUserNotExist(err) {
 				ctx.Flash.Error(ctx.Tr("form.user_not_exist"))
 				ctx.Redirect(ctx.Org.OrgLink + "/invitations/new")
 			} else {

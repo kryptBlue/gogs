@@ -7,26 +7,26 @@ package admin
 import (
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware"
+	"github.com/gogits/gogs/modules/context"
+	"github.com/gogits/gogs/modules/setting"
+	"github.com/gogits/gogs/routers"
 )
 
 const (
 	ORGS base.TplName = "admin/org/list"
 )
 
-func Organizations(ctx *middleware.Context) {
-	ctx.Data["Title"] = ctx.Tr("admin.orgs")
+func Organizations(ctx *context.Context) {
+	ctx.Data["Title"] = ctx.Tr("admin.organizations")
 	ctx.Data["PageIsAdmin"] = true
 	ctx.Data["PageIsAdminOrganizations"] = true
 
-	pageNum := 50
-	p := pagination(ctx, models.CountOrganizations(), pageNum)
-
-	var err error
-	ctx.Data["Orgs"], err = models.GetOrganizations(pageNum, (p-1)*pageNum)
-	if err != nil {
-		ctx.Handle(500, "GetOrganizations", err)
-		return
-	}
-	ctx.HTML(200, ORGS)
+	routers.RenderUserSearch(ctx, &routers.UserSearchOptions{
+		Type:     models.USER_TYPE_ORGANIZATION,
+		Counter:  models.CountOrganizations,
+		Ranger:   models.Organizations,
+		PageSize: setting.AdminOrgPagingNum,
+		OrderBy:  "id ASC",
+		TplName:  ORGS,
+	})
 }

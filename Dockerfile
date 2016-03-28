@@ -1,17 +1,22 @@
-FROM google/golang:latest
+FROM alpine:3.3
+MAINTAINER jp@roemer.im
 
-ENV TAGS="sqlite redis memcache cert" USER="git" HOME="/home/git"
+# Install system utils & Gogs runtime dependencies
+ADD https://github.com/tianon/gosu/releases/download/1.7/gosu-amd64 /usr/sbin/gosu
+RUN chmod +x /usr/sbin/gosu \
+ && apk --no-cache --no-progress add ca-certificates bash git linux-pam s6 curl openssh socat
 
-COPY  . /gopath/src/github.com/gogits/gogs/
-WORKDIR /gopath/src/github.com/gogits/gogs/
+ENV GOGS_CUSTOM /data/gogs
 
-RUN  go get -v -tags="$TAGS" github.com/gogits/gogs \
-  && go build -tags="$TAGS" \
-  && useradd -d $HOME -m $USER \
-  && chown -R $USER .
+COPY . /app/gogs/
+WORKDIR /app/gogs/
+RUN ./docker/build.sh
 
-USER $USER
+# Configure LibC Name Service
+COPY docker/nsswitch.conf /etc/nsswitch.conf
 
-ENTRYPOINT [ "./gogs" ]
-
-CMD [ "web" ]
+# Configure Docker Container
+VOLUME ["/data"]
+EXPOSE 22 3000
+ENTRYPOINT ["docker/start.sh"]
+CMD ["/bin/s6-svscan", "/app/gogs/docker/s6/"]
